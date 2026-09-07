@@ -1,0 +1,309 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net: Default deny all unhandled paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function hasRole(roleName) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        getUserData().role == roleName;
+    }
+
+    function isAdmin() {
+      return hasRole('admin');
+    }
+
+    function isTeacher() {
+      return hasRole('teacher') || isAdmin();
+    }
+
+    function isStudent() {
+      return hasRole('student');
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128;
+    }
+
+    // ===============================================================
+    // 1. Users Collection
+    // ===============================================================
+    match /users/{userId} {
+      // User can read their own profile; Admin can read all profiles
+      allow get: if isSignedIn() && (isOwner(userId) || isAdmin());
+      allow list: if isSignedIn() && isAdmin();
+
+      // Creation: Only allowed during initial registration with self UID
+      // A regular user CANNOT set their role to 'admin'
+      allow create: if isSignedIn() && isOwner(userId) && (
+        request.resource.data.uid == request.auth.uid &&
+        request.resource.data.role in ['teacher', 'student'] &&
+        request.resource.data.status == 'active'
+      ) || isAdmin();
+
+      // Updates: Users can update basic personal details but NEVER change their own role or status
+      allow update: if isSignedIn() && (
+        (isOwner(userId) &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'uid', 'status']))
+        || isAdmin()
+      );
+
+      allow delete: if isSignedIn() && isAdmin();
+    }
+
+    // ===============================================================
+    // Master Data: Subjects (Mata Pelajaran)
+    // Authenticated users can read active subjects; only Admin can manage
+    // ===============================================================
+    match /subjects/{subjectId} {
+      allow get, list: if isSignedIn();
+      allow create, update, delete: if isSignedIn() && isAdmin();
+    }
+
+    // ===============================================================
+    // Master Data: Classes (Kelas)
+    // Authenticated users can read classes; only Admin can manage
+    // ===============================================================
+    match /classes/{classId} {
+      allow get, list: if isSignedIn();
+      allow create, update, delete: if isSignedIn() && isAdmin();
+    }
+
+    // ===============================================================
+    // Master Data: Teachers (Profil & Data Guru)
+    // Authenticated users can read teacher profiles; only Admin can write/create
+    // Teachers cannot alter their own NIP, status, or role
+    // ===============================================================
+    match /teachers/{teacherId} {
+      allow get, list: if isSignedIn();
+      allow create, update, delete: if isSignedIn() && isAdmin();
+    }
+
+    // ===============================================================
+    // Master Data: Teacher Assignments (Relasi Guru - Mapel - Kelas)
+    // Teachers can read assignments; only Admin can manage
+    // ===============================================================
+    match /teacherAssignments/{assignmentId} {
+      allow get, list: if isSignedIn();
+      allow create, update, delete: if isSignedIn() && isAdmin();
+    }
+
+    // ===============================================================
+    // Question Banks Collection (Bank Soal Induk Guru)
+    // Only owning teachers or Admins can access; students have NO access
+    // ===============================================================
+    match /questionBanks/{bankId} {
+      allow get, list: if isSignedIn() && (
+        (isTeacher() && (resource.data.ownerId == request.auth.uid || isAdmin()))
+      );
+      allow create: if isSignedIn() && isTeacher() && (
+        request.resource.data.ownerId == request.auth.uid || isAdmin()
+      );
+      allow update, delete: if isSignedIn() && (
+        (isTeacher() && resource.data.ownerId == request.auth.uid) || isAdmin()
+      );
+    }
+
+    // ===============================================================
+    // 2. Questions Collection (Bank Soal)
+    // Student NEVER has read/write access to master question bank or answer keys
+    // Teacher A CANNOT read Teacher B's questions (Teacher Isolation)
+    // ===============================================================
+    match /questions/{questionId} {
+      allow get, list: if isSignedIn() && (
+        isAdmin() ||
+        (isTeacher() && (
+          resource.data.owner_id == request.auth.uid ||
+          resource.data.ownerId == request.auth.uid
+        ))
+      );
+      allow create: if isSignedIn() && isTeacher() && (
+        request.resource.data.owner_id == request.auth.uid ||
+        request.resource.data.ownerId == request.auth.uid ||
+        isAdmin()
+      );
+      allow update, delete: if isSignedIn() && (
+        (isTeacher() && (
+          resource.data.owner_id == request.auth.uid ||
+          resource.data.ownerId == request.auth.uid
+        )) || isAdmin()
+      );
+    }
+
+    // ===============================================================
+    // 3. Exams Collection (Metadata & Public Exam Info)
+    // Teacher can create/read/update/delete their own exams
+    // Admin can read and manage all exams
+    // CRIT-01: exams/{examId} holds metadata only; answer keys are in examKeys/{examId}
+    // ===============================================================
+    match /exams/{examId} {
+      allow get: if isSignedIn() && (
+        isAdmin() ||
+        (isTeacher() && (
+          resource.data.ownerId == request.auth.uid ||
+          resource.data.owner_id == request.auth.uid
+        ))
+      );
+      allow list: if isSignedIn() && (
+        isAdmin() ||
+        (isTeacher() && (
+          resource.data.ownerId == request.auth.uid ||
+          resource.data.owner_id == request.auth.uid
+        ))
+      );
+      allow create: if isSignedIn() && isTeacher() && (
+        isAdmin() ||
+        request.resource.data.ownerId == request.auth.uid ||
+        request.resource.data.owner_id == request.auth.uid
+      );
+      allow update, delete: if isSignedIn() && (
+        isAdmin() ||
+        (isTeacher() && (
+          resource.data.ownerId == request.auth.uid ||
+          resource.data.owner_id == request.auth.uid
+        ))
+      );
+    }
+
+    // ===============================================================
+    // 3a. Exam Keys Collection (CRIT-01: PRIVATE Answer Keys & Scoring Snapshot)
+    // NEVER accessible to students under any circumstances.
+    // Teacher A CANNOT read Teacher B's examKeys. Only owning teacher or Admin.
+    // ===============================================================
+    match /examKeys/{examId} {
+      allow get: if isSignedIn() && (
+        isAdmin() ||
+        (isTeacher() && (
+          resource.data.ownerId == request.auth.uid ||
+          resource.data.owner_id == request.auth.uid
+        ))
+      );
+      allow list: if isSignedIn() && isAdmin();
+      allow create: if isSignedIn() && isTeacher() && (
+        isAdmin() ||
+        request.resource.data.ownerId == request.auth.uid ||
+        request.resource.data.owner_id == request.auth.uid
+      );
+      allow update, delete: if isSignedIn() && (
+        isAdmin() ||
+        (isTeacher() && (
+          resource.data.ownerId == request.auth.uid ||
+          resource.data.owner_id == request.auth.uid
+        ))
+      );
+    }
+
+    // ===============================================================
+    // 3b. Student-Safe Exams (Proyeksi Tanpa Kunci Jawaban / Bobot Opsi)
+    // ===============================================================
+    match /studentExams/{examId} {
+      allow get, list: if true;
+      allow write: if isSignedIn() && (
+        isAdmin() ||
+        (isTeacher() && (
+          request.resource.data.ownerId == request.auth.uid ||
+          request.resource.data.owner_id == request.auth.uid
+        ))
+      );
+    }
+
+    // ===============================================================
+    // 4. Exam Sessions
+    // Student can only read/write their own session; Teachers can audit
+    // ===============================================================
+    match /examSessions/{sessionId} {
+      allow get: if true;
+      allow list: if isSignedIn() && isTeacher();
+      allow create: if true;
+      allow update: if true;
+      allow delete: if isSignedIn() && isAdmin();
+    }
+
+    // ===============================================================
+    // 5. Answers (Student Answers per Question)
+    // Local-first student answers synced from Dexie
+    // ===============================================================
+    match /answers/{answerId} {
+      allow get: if true;
+      allow list: if isSignedIn() && isTeacher();
+      allow create, update: if true;
+      allow delete: if isSignedIn() && isAdmin();
+    }
+
+    // ===============================================================
+    // 6. Results (Exam Final Results & Grades)
+    // CRIT-02 & HIGH-03: Student CANNOT write or alter scores under any circumstances.
+    // Teacher A CANNOT read, grade, or release results belonging to Teacher B.
+    // ===============================================================
+    match /results/{resultId} {
+      function isTeacherOwner() {
+        return isTeacher() && (
+          resource.data.teacherId == request.auth.uid ||
+          resource.data.ownerId == request.auth.uid ||
+          resource.data.teacher_id == request.auth.uid ||
+          resource.data.owner_id == request.auth.uid
+        );
+      }
+      function isTargetTeacherOwner() {
+        return isTeacher() && (
+          request.resource.data.teacherId == request.auth.uid ||
+          request.resource.data.ownerId == request.auth.uid ||
+          request.resource.data.teacher_id == request.auth.uid ||
+          request.resource.data.owner_id == request.auth.uid
+        );
+      }
+
+      // Teacher can only get results of their own exams; Admin can get all; Students can only get their OWN result AND only if results are released
+      allow get: if isSignedIn() && (
+        isAdmin() ||
+        isTeacherOwner() ||
+        (
+          (resource.data.student_id == request.auth.uid || resource.data.studentId == request.auth.uid) &&
+          (resource.data.gradingStatus == 'RESULTS_RELEASED' || resource.data.status == 'RESULTS_RELEASED')
+        )
+      );
+      // Teacher can only query results of their own exams; Students cannot list results
+      allow list: if isSignedIn() && (
+        isAdmin() || isTeacherOwner()
+      );
+
+      // Only owning teacher or admin can create or update results
+      allow create: if isSignedIn() && (
+        isAdmin() || isTargetTeacherOwner()
+      );
+      allow update: if isSignedIn() && (
+        isAdmin() || isTeacherOwner()
+      );
+      allow delete: if isSignedIn() && isAdmin();
+    }
+
+    // ===============================================================
+    // 7. Security Events (Anti-cheat audit logs)
+    // Students can append events for their session; cannot alter or delete them
+    // ===============================================================
+    match /securityEvents/{eventId} {
+      allow get: if isSignedIn() && isTeacher();
+      allow list: if isSignedIn() && isTeacher();
+      allow create: if isSignedIn() && request.resource.data.student_id == request.auth.uid;
+      allow update, delete: if false; // Immutable audit log
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "EXAMPUSA",
+  "description": "Platform Ujian Sekolah Modern, Aman, dan Responsif untuk Guru dan Murid SMP dengan Dukungan Offline-First, AI Question Generator, Monitoring Keamanan, Penilaian Otomatis, dan Export Excel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
